@@ -9,7 +9,8 @@ from app.core.db import get_session
 from app.models.models import Project, ProjectStatus
 from app.services import project as project_service
 from app.services import build as build_service
-from app.services import preview as preview_serviceimport asyncio
+from app.services import preview as preview_service
+import asyncio
 import json
 import logging
 import re
