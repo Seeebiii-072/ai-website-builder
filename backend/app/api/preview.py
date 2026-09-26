@@ -10,7 +10,6 @@ from sqlmodel import Session
 
 from app.core.db import get_session
 from app.core.events import event_bus
-from app.models.models import PreviewStatus
 from app.services import project as project_service
 from app.services import preview as preview_service
 
@@ -39,8 +38,8 @@ async def start(
 
     if project is None:
         raise HTTPException(
-            404,
-            "Project not found",
+            status_code=404,
+            detail="Project not found",
         )
 
     row = await preview_service.start_preview(
@@ -63,8 +62,8 @@ async def stop(
 
     if project is None:
         raise HTTPException(
-            404,
-            "Project not found",
+            status_code=404,
+            detail="Project not found",
         )
 
     await preview_service.stop_preview(
@@ -89,8 +88,8 @@ async def restart(
 
     if project is None:
         raise HTTPException(
-            404,
-            "Project not found",
+            status_code=404,
+            detail="Project not found",
         )
 
     row = await preview_service.restart_preview(
@@ -117,20 +116,18 @@ def get_preview(
 
     if row is None:
         raise HTTPException(
-            404,
-            "No preview for this project",
+            status_code=404,
+            detail="No preview for this project",
         )
 
     return row
 
 
 # ============================================================
-# PREVIEW URL REWRITE
+# PREVIEW PROXY HELPERS
 # ============================================================
 
-def _preview_prefix(
-    project_id: str,
-) -> str:
+def _preview_prefix(project_id: str) -> str:
     return (
         f"/api/projects/"
         f"{project_id}/preview/view"
@@ -142,11 +139,11 @@ def _rewrite_preview_urls(
     prefix: str,
 ) -> str:
     """
-    Rewrite root-relative URLs in generated
-    HTML so assets remain inside the proxy.
+    Rewrite root-relative URLs so that generated
+    Next.js assets remain inside the preview proxy.
     """
 
-    # HTML:
+    # HTML attributes:
     # src="/..."
     # href="/..."
     # action="/..."
@@ -162,7 +159,8 @@ def _rewrite_preview_urls(
         flags=re.IGNORECASE,
     )
 
-    # CSS url(/...)
+    # CSS:
+    # url(/...)
     text = re.sub(
         r'(url\(\s*["\']?)/(?!/)',
         lambda m: (
@@ -172,7 +170,8 @@ def _rewrite_preview_urls(
         flags=re.IGNORECASE,
     )
 
-    # Next.js static assets in inline JS
+    # Next.js static assets:
+    # "/_next/..."
     text = re.sub(
         r'(["\'`])/_next/',
         lambda m: (
@@ -182,7 +181,8 @@ def _rewrite_preview_urls(
         text,
     )
 
-    # Root API references
+    # Root API references:
+    # "/api/..."
     text = re.sub(
         r'(["\'`])/api/',
         lambda m: (
@@ -192,7 +192,7 @@ def _rewrite_preview_urls(
         text,
     )
 
-    # Browser-side fetch/XHR/history rewriting
+    # Browser-side fetch/XHR/history rewriting.
     bootstrap = f"""
 <script>
 (() => {{
@@ -219,6 +219,7 @@ def _rewrite_preview_urls(
             }}
 
             return url.toString();
+
         }} catch (_) {{
             return value;
         }}
@@ -228,18 +229,26 @@ def _rewrite_preview_urls(
         window.fetch.bind(window);
 
     window.fetch = function(input, init) {{
+
         if (typeof input === "string") {{
+
             input = rewriteUrl(input);
-        }} else if (input instanceof Request) {{
+
+        }} else if (
+            typeof Request !== "undefined" &&
+            input instanceof Request
+        ) {{
+
             const rewritten =
                 rewriteUrl(input.url);
 
             if (rewritten !== input.url) {{
+
                 input = new Request(
                     rewritten,
                     input
                 );
-            }}
+            }
         }}
 
         return originalFetch(
@@ -248,11 +257,13 @@ def _rewrite_preview_urls(
         );
     }};
 
+
     const originalOpen =
         XMLHttpRequest.prototype.open;
 
     XMLHttpRequest.prototype.open =
         function(method, url, ...rest) {{
+
             return originalOpen.call(
                 this,
                 method,
@@ -261,69 +272,69 @@ def _rewrite_preview_urls(
             );
         }};
 
+
     const originalPushState =
         history.pushState;
 
-    history.pushState = function(
-        state,
-        title,
-        url
-    ) {{
-        if (typeof url === "string") {{
-            url = rewriteUrl(url);
-        }}
+    history.pushState =
+        function(state, title, url) {{
 
-        return originalPushState.call(
-            this,
-            state,
-            title,
-            url
-        );
-    }};
+            if (typeof url === "string") {{
+                url = rewriteUrl(url);
+            }}
+
+            return originalPushState.call(
+                this,
+                state,
+                title,
+                url
+            );
+        }};
+
 
     const originalReplaceState =
         history.replaceState;
 
-    history.replaceState = function(
-        state,
-        title,
-        url
-    ) {{
-        if (typeof url === "string") {{
-            url = rewriteUrl(url);
-        }}
+    history.replaceState =
+        function(state, title, url) {{
 
-        return originalReplaceState.call(
-            this,
-            state,
-            title,
-            url
-        );
-    }};
+            if (typeof url === "string") {{
+                url = rewriteUrl(url);
+            }}
+
+            return originalReplaceState.call(
+                this,
+                state,
+                title,
+                url
+            );
+        }};
 }})();
 </script>
 """
 
-    if re.search(
-        r"</head>",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        text = re.sub(
-            r"</head>",
-            bootstrap + "</head>",
-            text,
-            count=1,
-            flags=re.IGNORECASE,
+    if "</head>" in text.lower():
+
+        index = text.lower().find("</head>")
+
+        text = (
+            text[:index]
+            + bootstrap
+            + text[index:]
         )
+
     else:
-        text = bootstrap + text
+
+        text = (
+            bootstrap
+            + text
+        )
 
     return text
 
 
 # ============================================================
-# SECURE PREVIEW PROXY
+# PREVIEW VIEW / PROXY
 # ============================================================
 
 @router.api_route(
@@ -338,300 +349,182 @@ def _rewrite_preview_urls(
         "OPTIONS",
     ],
 )
-@router.api_route(
-    "/{project_id}/preview/view/{path:path}",
-    methods=[
-        "GET",
-        "HEAD",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-    ],
-)
-async def proxy_preview(
+async def preview_view(
     project_id: str,
     request: Request,
-    path: str = "",
     session: Session = Depends(get_session),
 ):
     """
-    Securely proxy the project's private
-    localhost Next.js preview.
-
-    Browser:
-        /api/projects/{id}/preview/view/...
-
-    VM:
-        127.0.0.1:<stored-port>/...
+    Proxy browser requests to the project's local
+    Next.js preview server.
     """
 
-    # --------------------------------------------------------
-    # Validate project
-    # --------------------------------------------------------
-
-    project = project_service.get_project(
+    row = preview_service.get_preview(
         session,
         project_id,
     )
 
-    if project is None:
+    if row is None:
         raise HTTPException(
-            404,
-            "Project not found",
+            status_code=404,
+            detail="No preview for this project",
         )
 
-    # --------------------------------------------------------
-    # Validate preview
-    # --------------------------------------------------------
+    if row.port is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Preview has no assigned port",
+        )
 
-    preview = preview_service.get_preview(
-        session,
-        project_id,
-    )
-
-    if (
-        preview is None
-        or preview.port is None
-        or preview.status != PreviewStatus.RUNNING
+    if not preview_service.is_preview_running(
+        project_id
     ):
         raise HTTPException(
-            409,
-            "Preview is not running",
+            status_code=503,
+            detail="Preview server is not running",
         )
 
-    # --------------------------------------------------------
-    # Upstream
-    # --------------------------------------------------------
-
-    port = int(preview.port)
-
-    clean_path = path.lstrip("/")
-
-    upstream_url = (
-        f"http://127.0.0.1:"
-        f"{port}/"
-        f"{clean_path}"
+    # Preserve path after /preview/view
+    proxy_path = request.path_params.get(
+        "path",
+        "",
     )
 
-    # --------------------------------------------------------
-    # Request headers
-    # --------------------------------------------------------
+    # For the exact /preview/view URL.
+    if not proxy_path:
+        proxy_path = ""
+
+    target_url = (
+        f"http://127.0.0.1:{row.port}"
+        f"/{proxy_path}"
+    )
+
+    if request.url.query:
+        target_url += (
+            f"?{request.url.query}"
+        )
+
+    body = await request.body()
+
+    headers = {}
 
     hop_by_hop = {
         "host",
         "content-length",
         "connection",
         "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
         "transfer-encoding",
-        "upgrade",
     }
 
-    request_headers = {}
-
     for key, value in request.headers.items():
-        if key.lower() in hop_by_hop:
-            continue
 
-        request_headers[key] = value
-
-    # We need uncompressed content because HTML/CSS/JS
-    # may be rewritten below.
-    request_headers["accept-encoding"] = "identity"
-
-    body = await request.body()
-
-    # --------------------------------------------------------
-    # Forward request
-    # --------------------------------------------------------
+        if key.lower() not in hop_by_hop:
+            headers[key] = value
 
     try:
+
         async with httpx.AsyncClient(
             timeout=60.0,
             follow_redirects=False,
         ) as client:
 
             upstream = await client.request(
-                method=request.method,
-                url=upstream_url,
-                params=request.query_params,
-                headers=request_headers,
+                request.method,
+                target_url,
+                headers=headers,
                 content=body,
             )
 
-    except (
-        httpx.ConnectError,
-        httpx.ConnectTimeout,
-        httpx.ReadTimeout,
-        httpx.RemoteProtocolError,
-        httpx.HTTPError,
-    ) as exc:
+    except httpx.ConnectError as exc:
 
-        logger.warning(
-            "Preview proxy failed: "
-            "project=%s port=%s error=%s",
+        logger.exception(
+            "Preview proxy connection failed: "
+            "project=%s port=%s",
             project_id,
-            port,
-            exc,
+            row.port,
         )
 
         raise HTTPException(
-            502,
-            "Preview server is unavailable",
+            status_code=502,
+            detail=(
+                "Preview server is unavailable"
+            ),
+        ) from exc
+
+    except httpx.HTTPError as exc:
+
+        logger.exception(
+            "Preview proxy HTTP error: project=%s",
+            project_id,
         )
 
-    # --------------------------------------------------------
-    # Response headers
-    # --------------------------------------------------------
-
-    blocked_response_headers = {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "content-encoding",
-    }
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to communicate with "
+                "preview server"
+            ),
+        ) from exc
 
     response_headers = {}
 
+    response_hop_by_hop = {
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+    }
+
     for key, value in upstream.headers.items():
-        if key.lower() not in blocked_response_headers:
+
+        if key.lower() not in response_hop_by_hop:
+
             response_headers[key] = value
 
-    # --------------------------------------------------------
-    # Rewrite redirects
-    # --------------------------------------------------------
-
-    location = upstream.headers.get("location")
-
-    if location:
-
-        internal_origin = (
-            f"http://127.0.0.1:{port}"
+    content_type = (
+        upstream.headers.get(
+            "content-type",
+            "",
         )
-
-        if location.startswith(
-            internal_origin
-        ):
-            location = (
-                location[
-                    len(internal_origin):
-                ]
-                or "/"
-            )
-
-        if location.startswith("/"):
-            location = (
-                _preview_prefix(project_id)
-                + location
-            )
-
-        response_headers["location"] = location
-
-    # --------------------------------------------------------
-    # Rewrite response body
-    # --------------------------------------------------------
+    )
 
     content = upstream.content
 
-    content_type = upstream.headers.get(
-        "content-type",
-        "",
-    ).lower()
-
-    prefix = _preview_prefix(
-        project_id
-    )
-
-    # HTML
+    # Rewrite HTML so its root-relative resources
+    # continue going through this proxy.
     if (
-        "text/html" in content_type
-        or "application/xhtml+xml"
-        in content_type
+        "text/html" in content_type.lower()
+        and content
     ):
 
         try:
-            text_body = content.decode(
-                "utf-8",
+
+            text = content.decode(
+                upstream.encoding or "utf-8",
                 errors="replace",
             )
 
-            text_body = _rewrite_preview_urls(
-                text_body,
+            prefix = _preview_prefix(
+                project_id
+            )
+
+            text = _rewrite_preview_urls(
+                text,
                 prefix,
             )
 
-            content = text_body.encode(
-                "utf-8"
+            content = text.encode("utf-8")
+
+            response_headers.pop(
+                "content-encoding",
+                None,
             )
 
         except Exception:
 
             logger.exception(
-                "Failed to rewrite preview HTML "
-                "for project=%s",
-                project_id,
-            )
-
-    # CSS / JavaScript
-    elif (
-        "text/css" in content_type
-        or "javascript" in content_type
-        or "ecmascript" in content_type
-    ):
-
-        try:
-            text_body = content.decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            text_body = re.sub(
-                r'(["\'`])/_next/',
-                lambda m: (
-                    f"{m.group(1)}"
-                    f"{prefix}/_next/"
-                ),
-                text_body,
-            )
-
-            text_body = re.sub(
-                r'(["\'`])/api/',
-                lambda m: (
-                    f"{m.group(1)}"
-                    f"{prefix}/api/"
-                ),
-                text_body,
-            )
-
-            text_body = re.sub(
-                r'(url\(\s*["\']?)/(?!/)',
-                lambda m: (
-                    f"{m.group(1)}"
-                    f"{prefix}/"
-                ),
-                text_body,
-            )
-
-            content = text_body.encode(
-                "utf-8"
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Failed to rewrite preview asset "
-                "for project=%s",
+                "Failed to rewrite preview HTML: "
+                "project=%s",
                 project_id,
             )
 
@@ -651,9 +544,7 @@ async def proxy_preview(
 async def events(
     project_id: str,
 ):
-    """
-    Server-Sent Events stream of status updates.
-    """
+    """Server-Sent Events stream of status updates."""
 
     queue = event_bus.subscribe(
         project_id
