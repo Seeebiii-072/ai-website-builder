@@ -57,12 +57,7 @@ def _serialize(
         preview
         and preview.status == PreviewStatus.RUNNING
     ):
-        preview_url = (
-            preview.url
-            or preview_service.get_public_preview_url(
-                project.id
-            )
-        )
+        preview_url = f"/api/projects/{project.id}/preview/view"
 
     return ProjectResponse(
         id=project.id,
