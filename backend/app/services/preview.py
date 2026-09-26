@@ -1,811 +1,691 @@
 import asyncio
+import json
 import logging
-import os
-import shutil
-import socket
-import subprocess
-import sys
-from pathlib import Path
-from typing import Optional
+import re
 
 import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sse_starlette.sse import EventSourceResponse
 from sqlmodel import Session
 
-from app.core.config import settings
+from app.core.db import get_session
 from app.core.events import event_bus
-from app.models.models import Project, Preview, PreviewStatus, ProjectStatus
+from app.models.models import PreviewStatus
 from app.services import project as project_service
+from app.services import preview as preview_service
 
 
-logger = logging.getLogger("preview")
+logger = logging.getLogger("api.preview")
 
-
-# ============================================================
-# LIVE PROCESS REGISTRY
-# ============================================================
-
-_RUNNING_PROCESSES: dict[str, subprocess.Popen] = {}
-
-
-# ============================================================
-# PUBLIC PREVIEW URL
-# ============================================================
-
-def get_public_preview_url(project_id: str) -> str:
-    """
-    Browser-facing preview URL.
-
-    The actual Next.js process remains private on
-    127.0.0.1:<dynamic-port>.
-    """
-    return f"/api/projects/{project_id}/preview/"
+router = APIRouter(
+    prefix="/api/projects",
+    tags=["preview"],
+)
 
 
 # ============================================================
-# WINDOWS / NPM HELPERS
+# PREVIEW LIFECYCLE
 # ============================================================
 
-def _npm_executable() -> str:
-    """
-    Find npm executable.
-    """
-
-    candidates = []
-
-    if sys.platform == "win32":
-        candidates.extend(
-            [
-                shutil.which("npm.cmd"),
-                shutil.which("npm"),
-            ]
-        )
-    else:
-        candidates.extend(
-            [
-                shutil.which("npm"),
-                shutil.which("npm.cmd"),
-            ]
-        )
-
-    for executable in candidates:
-        if executable:
-            return executable
-
-    raise RuntimeError(
-        "npm was not found on PATH. "
-        "Install Node.js/npm and restart the backend terminal."
-    )
-
-
-def _build_environment() -> dict[str, str]:
-    """
-    Build environment for the Next.js dev server.
-    """
-
-    env = os.environ.copy()
-
-    # Prevent interactive npm prompts.
-    env["CI"] = "1"
-
-    return env
-
-
-# ============================================================
-# PORT MANAGEMENT
-# ============================================================
-
-def _port_is_free(port: int) -> bool:
-    """
-    Check whether localhost port is currently available.
-    """
-
-    with socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM,
-    ) as sock:
-        sock.settimeout(0.3)
-
-        try:
-            sock.bind(("127.0.0.1", port))
-            return True
-
-        except OSError:
-            return False
-
-
-def find_available_port() -> int:
-    """
-    Find an available preview port.
-    """
-
-    for port in range(
-        settings.preview_start_port,
-        settings.preview_max_port + 1,
-    ):
-        if _port_is_free(port):
-            return port
-
-    raise RuntimeError(
-        f"No available port between "
-        f"{settings.preview_start_port} and "
-        f"{settings.preview_max_port}"
-    )
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-def _get_or_create_preview_row(
-    session: Session,
+@router.post("/{project_id}/preview/start")
+async def start(
     project_id: str,
-) -> Preview:
-    """
-    Get the Preview row or create it.
-    """
+    session: Session = Depends(get_session),
+):
+    project = project_service.get_project(
+        session,
+        project_id,
+    )
 
-    row = session.get(
-        Preview,
+    if project is None:
+        raise HTTPException(
+            404,
+            "Project not found",
+        )
+
+    row = await preview_service.start_preview(
+        session,
+        project,
+    )
+
+    return row
+
+
+@router.post("/{project_id}/preview/stop")
+async def stop(
+    project_id: str,
+    session: Session = Depends(get_session),
+):
+    project = project_service.get_project(
+        session,
+        project_id,
+    )
+
+    if project is None:
+        raise HTTPException(
+            404,
+            "Project not found",
+        )
+
+    await preview_service.stop_preview(
+        session,
+        project_id,
+    )
+
+    return {
+        "status": "stopped",
+    }
+
+
+@router.post("/{project_id}/preview/restart")
+async def restart(
+    project_id: str,
+    session: Session = Depends(get_session),
+):
+    project = project_service.get_project(
+        session,
+        project_id,
+    )
+
+    if project is None:
+        raise HTTPException(
+            404,
+            "Project not found",
+        )
+
+    row = await preview_service.restart_preview(
+        session,
+        project,
+    )
+
+    return row
+
+
+# ============================================================
+# PREVIEW STATUS
+# ============================================================
+
+@router.get("/{project_id}/preview")
+def get_preview(
+    project_id: str,
+    session: Session = Depends(get_session),
+):
+    row = preview_service.get_preview(
+        session,
         project_id,
     )
 
     if row is None:
-        row = Preview(
-            project_id=project_id,
-            status=PreviewStatus.STOPPED,
+        raise HTTPException(
+            404,
+            "No preview for this project",
         )
-
-        session.add(row)
-        session.commit()
-        session.refresh(row)
 
     return row
 
 
 # ============================================================
-# HTTP HEALTH CHECK
+# PREVIEW URL REWRITE
 # ============================================================
 
-async def _wait_until_responsive(
-    url: str,
-    timeout_seconds: int = 90,
-) -> bool:
-    """
-    Wait until the Next.js preview server responds.
-    """
-
-    loop = asyncio.get_running_loop()
-
-    deadline = loop.time() + timeout_seconds
-
-    async with httpx.AsyncClient(
-        timeout=2.0,
-        follow_redirects=True,
-    ) as client:
-
-        while loop.time() < deadline:
-
-            try:
-                response = await client.get(url)
-
-                if response.status_code < 500:
-                    return True
-
-            except (
-                httpx.ConnectError,
-                httpx.ConnectTimeout,
-                httpx.ReadTimeout,
-                httpx.RemoteProtocolError,
-                httpx.HTTPError,
-            ):
-                pass
-
-            await asyncio.sleep(1)
-
-    return False
-
-
-# ============================================================
-# PROCESS LOG READER
-# ============================================================
-
-async def _read_process_output(
+def _preview_prefix(
     project_id: str,
-    proc: subprocess.Popen,
-) -> None:
+) -> str:
+    return (
+        f"/api/projects/"
+        f"{project_id}/preview/view"
+    )
+
+
+def _rewrite_preview_urls(
+    text: str,
+    prefix: str,
+) -> str:
     """
-    Continuously consume stdout from the Next.js process.
+    Rewrite root-relative URLs in generated
+    HTML so assets remain inside the proxy.
     """
 
-    if proc.stdout is None:
-        return
+    # HTML:
+    # src="/..."
+    # href="/..."
+    # action="/..."
+    # poster="/..."
+    # formaction="/..."
+    text = re.sub(
+        r'((?:src|href|action|poster|formaction)'
+        r'\s*=\s*["\'])/(?!/)',
+        lambda m: (
+            f"{m.group(1)}{prefix}/"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # CSS url(/...)
+    text = re.sub(
+        r'(url\(\s*["\']?)/(?!/)',
+        lambda m: (
+            f"{m.group(1)}{prefix}/"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Next.js static assets in inline JS
+    text = re.sub(
+        r'(["\'`])/_next/',
+        lambda m: (
+            f"{m.group(1)}"
+            f"{prefix}/_next/"
+        ),
+        text,
+    )
+
+    # Root API references
+    text = re.sub(
+        r'(["\'`])/api/',
+        lambda m: (
+            f"{m.group(1)}"
+            f"{prefix}/api/"
+        ),
+        text,
+    )
+
+    # Browser-side fetch/XHR/history rewriting
+    bootstrap = f"""
+<script>
+(() => {{
+    const PREFIX = {json.dumps(prefix)};
+
+    function rewriteUrl(value) {{
+        if (typeof value !== "string" || !value) {{
+            return value;
+        }}
+
+        try {{
+            const url = new URL(
+                value,
+                window.location.href
+            );
+
+            if (
+                url.origin === window.location.origin &&
+                url.pathname.startsWith("/") &&
+                !url.pathname.startsWith(PREFIX)
+            ) {{
+                url.pathname =
+                    PREFIX + url.pathname;
+            }}
+
+            return url.toString();
+        }} catch (_) {{
+            return value;
+        }}
+    }}
+
+    const originalFetch =
+        window.fetch.bind(window);
+
+    window.fetch = function(input, init) {{
+        if (typeof input === "string") {{
+            input = rewriteUrl(input);
+        }} else if (input instanceof Request) {{
+            const rewritten =
+                rewriteUrl(input.url);
+
+            if (rewritten !== input.url) {{
+                input = new Request(
+                    rewritten,
+                    input
+                );
+            }}
+        }}
+
+        return originalFetch(
+            input,
+            init
+        );
+    }};
+
+    const originalOpen =
+        XMLHttpRequest.prototype.open;
+
+    XMLHttpRequest.prototype.open =
+        function(method, url, ...rest) {{
+            return originalOpen.call(
+                this,
+                method,
+                rewriteUrl(url),
+                ...rest
+            );
+        }};
+
+    const originalPushState =
+        history.pushState;
+
+    history.pushState = function(
+        state,
+        title,
+        url
+    ) {{
+        if (typeof url === "string") {{
+            url = rewriteUrl(url);
+        }}
+
+        return originalPushState.call(
+            this,
+            state,
+            title,
+            url
+        );
+    }};
+
+    const originalReplaceState =
+        history.replaceState;
+
+    history.replaceState = function(
+        state,
+        title,
+        url
+    ) {{
+        if (typeof url === "string") {{
+            url = rewriteUrl(url);
+        }}
+
+        return originalReplaceState.call(
+            this,
+            state,
+            title,
+            url
+        );
+    }};
+}})();
+</script>
+"""
+
+    if re.search(
+        r"</head>",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        text = re.sub(
+            r"</head>",
+            bootstrap + "</head>",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    else:
+        text = bootstrap + text
+
+    return text
+
+
+# ============================================================
+# SECURE PREVIEW PROXY
+# ============================================================
+
+@router.api_route(
+    "/{project_id}/preview/view",
+    methods=[
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
+)
+@router.api_route(
+    "/{project_id}/preview/view/{path:path}",
+    methods=[
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
+)
+async def proxy_preview(
+    project_id: str,
+    request: Request,
+    path: str = "",
+    session: Session = Depends(get_session),
+):
+    """
+    Securely proxy the project's private
+    localhost Next.js preview.
+
+    Browser:
+        /api/projects/{id}/preview/view/...
+
+    VM:
+        127.0.0.1:<stored-port>/...
+    """
+
+    # --------------------------------------------------------
+    # Validate project
+    # --------------------------------------------------------
+
+    project = project_service.get_project(
+        session,
+        project_id,
+    )
+
+    if project is None:
+        raise HTTPException(
+            404,
+            "Project not found",
+        )
+
+    # --------------------------------------------------------
+    # Validate preview
+    # --------------------------------------------------------
+
+    preview = preview_service.get_preview(
+        session,
+        project_id,
+    )
+
+    if (
+        preview is None
+        or preview.port is None
+        or preview.status != PreviewStatus.RUNNING
+    ):
+        raise HTTPException(
+            409,
+            "Preview is not running",
+        )
+
+    # --------------------------------------------------------
+    # Upstream
+    # --------------------------------------------------------
+
+    port = int(preview.port)
+
+    clean_path = path.lstrip("/")
+
+    upstream_url = (
+        f"http://127.0.0.1:"
+        f"{port}/"
+        f"{clean_path}"
+    )
+
+    # --------------------------------------------------------
+    # Request headers
+    # --------------------------------------------------------
+
+    hop_by_hop = {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+
+    request_headers = {}
+
+    for key, value in request.headers.items():
+        if key.lower() in hop_by_hop:
+            continue
+
+        request_headers[key] = value
+
+    # We need uncompressed content because HTML/CSS/JS
+    # may be rewritten below.
+    request_headers["accept-encoding"] = "identity"
+
+    body = await request.body()
+
+    # --------------------------------------------------------
+    # Forward request
+    # --------------------------------------------------------
 
     try:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=False,
+        ) as client:
 
-        while True:
-
-            line = await asyncio.to_thread(
-                proc.stdout.readline
+            upstream = await client.request(
+                method=request.method,
+                url=upstream_url,
+                params=request.query_params,
+                headers=request_headers,
+                content=body,
             )
 
-            if not line:
-                break
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        httpx.HTTPError,
+    ) as exc:
 
-            line = line.rstrip()
-
-            if line:
-                logger.info(
-                    "[preview:%s] %s",
-                    project_id,
-                    line,
-                )
-
-    except Exception as exc:
-
-        logger.debug(
-            "Preview output reader stopped for %s: %s",
+        logger.warning(
+            "Preview proxy failed: "
+            "project=%s port=%s error=%s",
             project_id,
+            port,
             exc,
         )
 
-
-# ============================================================
-# START PREVIEW
-# ============================================================
-
-async def start_preview(
-    session: Session,
-    project: Project,
-) -> Preview:
-
-    workspace = Path(
-        project.workspace_path
-    )
-
-    row = _get_or_create_preview_row(
-        session,
-        project.id,
-    )
-
-    # --------------------------------------------------------
-    # Validate workspace
-    # --------------------------------------------------------
-
-    if not workspace.exists():
-
-        row.status = PreviewStatus.FAILED
-
-        row.error_message = (
-            f"Project workspace does not exist: {workspace}"
+        raise HTTPException(
+            502,
+            "Preview server is unavailable",
         )
 
-        session.add(row)
-        session.commit()
+    # --------------------------------------------------------
+    # Response headers
+    # --------------------------------------------------------
 
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
+    blocked_response_headers = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "content-encoding",
+    }
+
+    response_headers = {}
+
+    for key, value in upstream.headers.items():
+        if key.lower() not in blocked_response_headers:
+            response_headers[key] = value
+
+    # --------------------------------------------------------
+    # Rewrite redirects
+    # --------------------------------------------------------
+
+    location = upstream.headers.get("location")
+
+    if location:
+
+        internal_origin = (
+            f"http://127.0.0.1:{port}"
         )
 
-        return row
-
-    # --------------------------------------------------------
-    # Stop previous preview
-    # --------------------------------------------------------
-
-    await stop_preview(
-        session,
-        project.id,
-    )
-
-    # --------------------------------------------------------
-    # Find available port
-    # --------------------------------------------------------
-
-    try:
-
-        port = find_available_port()
-
-    except Exception as exc:
-
-        row.status = PreviewStatus.FAILED
-
-        row.error_message = (
-            f"Unable to find preview port: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
-        )
-
-        return row
-
-    # --------------------------------------------------------
-    # Update DB
-    # --------------------------------------------------------
-
-    row.status = PreviewStatus.STARTING
-    row.port = port
-    row.pid = None
-    row.url = None
-    row.error_message = None
-
-    session.add(row)
-    session.commit()
-
-    await event_bus.publish(
-        project.id,
-        "preview_starting",
-        {
-            "port": port,
-        },
-    )
-
-    # --------------------------------------------------------
-    # Find npm
-    # --------------------------------------------------------
-
-    try:
-
-        npm = _npm_executable()
-
-    except Exception as exc:
-
-        row.status = PreviewStatus.FAILED
-        row.error_message = str(exc)
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
-        )
-
-        return row
-
-    # --------------------------------------------------------
-    # Next.js command
-    # --------------------------------------------------------
-
-    cmd = [
-        npm,
-        "run",
-        "dev",
-        "--",
-        "--port",
-        str(port),
-        "--hostname",
-        "127.0.0.1",
-    ]
-
-    logger.info(
-        "Starting preview for project=%s",
-        project.id,
-    )
-
-    logger.info(
-        "Preview workspace=%s",
-        workspace,
-    )
-
-    logger.info(
-        "Preview command=%s",
-        cmd,
-    )
-
-    # --------------------------------------------------------
-    # Cross-platform subprocess startup
-    # --------------------------------------------------------
-
-    try:
-
-        def start_process() -> subprocess.Popen:
-
-            kwargs = {
-                "args": cmd,
-                "cwd": str(workspace),
-                "stdin": subprocess.DEVNULL,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
-                "shell": False,
-                "env": _build_environment(),
-            }
-
-            if sys.platform == "win32":
-
-                kwargs["creationflags"] = (
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                )
-
-            return subprocess.Popen(
-                **kwargs
+        if location.startswith(
+            internal_origin
+        ):
+            location = (
+                location[
+                    len(internal_origin):
+                ]
+                or "/"
             )
 
-        proc = await asyncio.to_thread(
-            start_process
-        )
-
-    except Exception as exc:
-
-        row.status = PreviewStatus.FAILED
-
-        row.error_message = (
-            f"Failed to start dev server: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        logger.exception(
-            "Failed to start preview for project=%s",
-            project.id,
-        )
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
-        )
-
-        return row
-
-    # --------------------------------------------------------
-    # Register process
-    # --------------------------------------------------------
-
-    _RUNNING_PROCESSES[
-        project.id
-    ] = proc
-
-    row.pid = proc.pid
-
-    session.add(row)
-    session.commit()
-
-    logger.info(
-        "Preview process started: "
-        "project=%s pid=%s port=%s",
-        project.id,
-        proc.pid,
-        port,
-    )
-
-    # --------------------------------------------------------
-    # Start background output reader
-    # --------------------------------------------------------
-
-    asyncio.create_task(
-        _read_process_output(
-            project.id,
-            proc,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Private localhost health check
-    # --------------------------------------------------------
-
-    private_url = (
-        f"http://127.0.0.1:{port}"
-    )
-
-    responsive = await _wait_until_responsive(
-        private_url,
-        timeout_seconds=90,
-    )
-
-    # --------------------------------------------------------
-    # Preview did not start
-    # --------------------------------------------------------
-
-    if not responsive:
-
-        returncode = proc.poll()
-
-        if returncode is None:
-
-            error_message = (
-                "Preview server did not become "
-                "responsive within 90 seconds."
+        if location.startswith("/"):
+            location = (
+                _preview_prefix(project_id)
+                + location
             )
 
-        else:
-
-            error_message = (
-                "Preview server exited unexpectedly "
-                f"with code {returncode}."
-            )
-
-        row.status = PreviewStatus.FAILED
-        row.error_message = error_message
-
-        logger.error(
-            "Preview failed: project=%s pid=%s "
-            "returncode=%s",
-            project.id,
-            proc.pid,
-            returncode,
-        )
-
-        try:
-
-            if proc.poll() is None:
-
-                proc.terminate()
-
-                try:
-
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            proc.wait
-                        ),
-                        timeout=5,
-                    )
-
-                except asyncio.TimeoutError:
-
-                    proc.kill()
-
-                    await asyncio.to_thread(
-                        proc.wait
-                    )
-
-        except Exception:
-
-            logger.exception(
-                "Error cleaning failed preview process"
-            )
-
-        _RUNNING_PROCESSES.pop(
-            project.id,
-            None,
-        )
-
-        row.pid = None
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
-        )
-
-        return row
+        response_headers["location"] = location
 
     # --------------------------------------------------------
-    # Check process after successful response
+    # Rewrite response body
     # --------------------------------------------------------
 
-    returncode = proc.poll()
+    content = upstream.content
 
-    if returncode is not None:
+    content_type = upstream.headers.get(
+        "content-type",
+        "",
+    ).lower()
 
-        row.status = PreviewStatus.FAILED
-
-        row.error_message = (
-            "Preview server exited unexpectedly "
-            f"with code {returncode}"
-        )
-
-        _RUNNING_PROCESSES.pop(
-            project.id,
-            None,
-        )
-
-        row.pid = None
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project.id,
-            "preview_failed",
-            {
-                "error": row.error_message,
-            },
-        )
-
-        return row
-
-    # --------------------------------------------------------
-    # Preview is running
-    # --------------------------------------------------------
-
-    row.status = PreviewStatus.RUNNING
-
-    # IMPORTANT:
-    # Store the browser-facing proxy URL, not localhost.
-    row.url = get_public_preview_url(
-        project.id
-    )
-
-    row.error_message = None
-
-    session.add(row)
-    session.commit()
-
-    logger.info(
-        "Preview is READY: project=%s url=%s",
-        project.id,
-        row.url,
-    )
-
-    await event_bus.publish(
-        project.id,
-        "preview_ready",
-        {
-            "url": row.url,
-        },
-    )
-
-    # --------------------------------------------------------
-    # Project becomes READY
-    # --------------------------------------------------------
-
-    project_service.set_status(
-        session,
-        project,
-        ProjectStatus.READY,
-    )
-
-    return row
-
-
-# ============================================================
-# STOP PREVIEW
-# ============================================================
-
-async def stop_preview(
-    session: Session,
-    project_id: str,
-) -> None:
-
-    proc = _RUNNING_PROCESSES.pop(
-        project_id,
-        None,
-    )
-
-    if proc is not None:
-
-        try:
-
-            if proc.poll() is None:
-
-                logger.info(
-                    "Stopping preview: "
-                    "project=%s pid=%s",
-                    project_id,
-                    proc.pid,
-                )
-
-                proc.terminate()
-
-                try:
-
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            proc.wait
-                        ),
-                        timeout=10,
-                    )
-
-                except asyncio.TimeoutError:
-
-                    logger.warning(
-                        "Preview did not terminate "
-                        "gracefully. Killing process: "
-                        "project=%s pid=%s",
-                        project_id,
-                        proc.pid,
-                    )
-
-                    proc.kill()
-
-                    await asyncio.to_thread(
-                        proc.wait
-                    )
-
-        except Exception:
-
-            logger.exception(
-                "Error stopping preview process: "
-                "project=%s",
-                project_id,
-            )
-
-    # --------------------------------------------------------
-    # Update DB
-    # --------------------------------------------------------
-
-    row = session.get(
-        Preview,
-        project_id,
-    )
-
-    if row is not None:
-
-        row.status = PreviewStatus.STOPPED
-        row.pid = None
-        row.url = None
-
-        session.add(row)
-        session.commit()
-
-        await event_bus.publish(
-            project_id,
-            "preview_stopped",
-            {},
-        )
-
-
-# ============================================================
-# RESTART
-# ============================================================
-
-async def restart_preview(
-    session: Session,
-    project: Project,
-) -> Preview:
-
-    return await start_preview(
-        session,
-        project,
-    )
-
-
-# ============================================================
-# GET PREVIEW
-# ============================================================
-
-def get_preview(
-    session: Session,
-    project_id: str,
-) -> Optional[Preview]:
-
-    return session.get(
-        Preview,
-        project_id,
-    )
-
-
-# ============================================================
-# RUNNING CHECK
-# ============================================================
-
-def is_preview_running(
-    project_id: str,
-) -> bool:
-
-    proc = _RUNNING_PROCESSES.get(
+    prefix = _preview_prefix(
         project_id
     )
 
-    return (
-        proc is not None
-        and proc.poll() is None
+    # HTML
+    if (
+        "text/html" in content_type
+        or "application/xhtml+xml"
+        in content_type
+    ):
+
+        try:
+            text_body = content.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            text_body = _rewrite_preview_urls(
+                text_body,
+                prefix,
+            )
+
+            content = text_body.encode(
+                "utf-8"
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to rewrite preview HTML "
+                "for project=%s",
+                project_id,
+            )
+
+    # CSS / JavaScript
+    elif (
+        "text/css" in content_type
+        or "javascript" in content_type
+        or "ecmascript" in content_type
+    ):
+
+        try:
+            text_body = content.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            text_body = re.sub(
+                r'(["\'`])/_next/',
+                lambda m: (
+                    f"{m.group(1)}"
+                    f"{prefix}/_next/"
+                ),
+                text_body,
+            )
+
+            text_body = re.sub(
+                r'(["\'`])/api/',
+                lambda m: (
+                    f"{m.group(1)}"
+                    f"{prefix}/api/"
+                ),
+                text_body,
+            )
+
+            text_body = re.sub(
+                r'(url\(\s*["\']?)/(?!/)',
+                lambda m: (
+                    f"{m.group(1)}"
+                    f"{prefix}/"
+                ),
+                text_body,
+            )
+
+            content = text_body.encode(
+                "utf-8"
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to rewrite preview asset "
+                "for project=%s",
+                project_id,
+            )
+
+    return Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=None,
+    )
+
+
+# ============================================================
+# SSE EVENTS
+# ============================================================
+
+@router.get("/{project_id}/events")
+async def events(
+    project_id: str,
+):
+    """
+    Server-Sent Events stream of status updates.
+    """
+
+    queue = event_bus.subscribe(
+        project_id
+    )
+
+    async def event_generator():
+
+        try:
+
+            while True:
+
+                payload = await queue.get()
+
+                data = json.loads(
+                    payload
+                )
+
+                yield {
+                    "event": data["type"],
+                    "data": json.dumps(data),
+                }
+
+        except asyncio.CancelledError:
+            pass
+
+        finally:
+
+            event_bus.unsubscribe(
+                project_id,
+                queue,
+            )
+
+    return EventSourceResponse(
+        event_generator()
     )
