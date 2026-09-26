@@ -1,0 +1,26 @@
+# --- Environment / secrets ---
+.env
+.env.local
+.env.*.local
+
+# --- Backend (Python) ---
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+backend/.pytest_cache/
+backend/data/app.db
+backend/data/projects/
+backend/data/_exports/
+
+# --- Frontend (Node/Next.js) ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+node_modules/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
