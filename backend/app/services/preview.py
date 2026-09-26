@@ -24,9 +24,21 @@ logger = logging.getLogger("preview")
 # LIVE PROCESS REGISTRY
 # ============================================================
 
-# Popen objects are kept in memory.
-# SQLite stores only pid/port/status/url.
 _RUNNING_PROCESSES: dict[str, subprocess.Popen] = {}
+
+
+# ============================================================
+# PUBLIC PREVIEW URL
+# ============================================================
+
+def get_public_preview_url(project_id: str) -> str:
+    """
+    Browser-facing preview URL.
+
+    The actual Next.js process remains private on
+    127.0.0.1:<dynamic-port>.
+    """
+    return f"/api/projects/{project_id}/preview/"
 
 
 # ============================================================
@@ -36,10 +48,8 @@ _RUNNING_PROCESSES: dict[str, subprocess.Popen] = {}
 def _npm_executable() -> str:
     """
     Find npm executable.
-
-    On Windows, npm.cmd is normally the executable that should
-    be launched through subprocess.
     """
+
     candidates = []
 
     if sys.platform == "win32":
@@ -69,8 +79,9 @@ def _npm_executable() -> str:
 
 def _build_environment() -> dict[str, str]:
     """
-    Build a clean environment for the Next.js dev server.
+    Build environment for the Next.js dev server.
     """
+
     env = os.environ.copy()
 
     # Prevent interactive npm prompts.
@@ -87,12 +98,17 @@ def _port_is_free(port: int) -> bool:
     """
     Check whether localhost port is currently available.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+
+    with socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    ) as sock:
         sock.settimeout(0.3)
 
         try:
             sock.bind(("127.0.0.1", port))
             return True
+
         except OSError:
             return False
 
@@ -101,6 +117,7 @@ def find_available_port() -> int:
     """
     Find an available preview port.
     """
+
     for port in range(
         settings.preview_start_port,
         settings.preview_max_port + 1,
@@ -126,7 +143,11 @@ def _get_or_create_preview_row(
     """
     Get the Preview row or create it.
     """
-    row = session.get(Preview, project_id)
+
+    row = session.get(
+        Preview,
+        project_id,
+    )
 
     if row is None:
         row = Preview(
@@ -151,11 +172,10 @@ async def _wait_until_responsive(
 ) -> bool:
     """
     Wait until the Next.js preview server responds.
-
-    We intentionally use HTTP polling instead of relying only
-    on process state.
     """
+
     loop = asyncio.get_running_loop()
+
     deadline = loop.time() + timeout_seconds
 
     async with httpx.AsyncClient(
@@ -195,17 +215,18 @@ async def _read_process_output(
 ) -> None:
     """
     Continuously consume stdout from the Next.js process.
-
-    This is important because stdout=subprocess.PIPE can
-    eventually block a child process if nobody consumes it.
     """
 
     if proc.stdout is None:
         return
 
     try:
+
         while True:
-            line = await asyncio.to_thread(proc.stdout.readline)
+
+            line = await asyncio.to_thread(
+                proc.stdout.readline
+            )
 
             if not line:
                 break
@@ -220,6 +241,7 @@ async def _read_process_output(
                 )
 
     except Exception as exc:
+
         logger.debug(
             "Preview output reader stopped for %s: %s",
             project_id,
@@ -236,7 +258,9 @@ async def start_preview(
     project: Project,
 ) -> Preview:
 
-    workspace = Path(project.workspace_path)
+    workspace = Path(
+        project.workspace_path
+    )
 
     row = _get_or_create_preview_row(
         session,
@@ -248,7 +272,9 @@ async def start_preview(
     # --------------------------------------------------------
 
     if not workspace.exists():
+
         row.status = PreviewStatus.FAILED
+
         row.error_message = (
             f"Project workspace does not exist: {workspace}"
         )
@@ -280,10 +306,13 @@ async def start_preview(
     # --------------------------------------------------------
 
     try:
+
         port = find_available_port()
 
     except Exception as exc:
+
         row.status = PreviewStatus.FAILED
+
         row.error_message = (
             f"Unable to find preview port: "
             f"{type(exc).__name__}: {exc}"
@@ -328,9 +357,11 @@ async def start_preview(
     # --------------------------------------------------------
 
     try:
+
         npm = _npm_executable()
 
     except Exception as exc:
+
         row.status = PreviewStatus.FAILED
         row.error_message = str(exc)
 
@@ -378,12 +409,13 @@ async def start_preview(
     )
 
     # --------------------------------------------------------
-    # Windows-safe subprocess startup
+    # Cross-platform subprocess startup
     # --------------------------------------------------------
 
     try:
 
         def start_process() -> subprocess.Popen:
+
             kwargs = {
                 "args": cmd,
                 "cwd": str(workspace),
@@ -397,24 +429,16 @@ async def start_preview(
                 "env": _build_environment(),
             }
 
-            # Windows:
-            # CREATE_NEW_PROCESS_GROUP allows us to manage the
-            # child process more safely.
             if sys.platform == "win32":
+
                 kwargs["creationflags"] = (
                     subprocess.CREATE_NEW_PROCESS_GROUP
                 )
 
-            return subprocess.Popen(**kwargs)
+            return subprocess.Popen(
+                **kwargs
+            )
 
-        # IMPORTANT:
-        #
-        # Do NOT use:
-        #
-        # asyncio.create_subprocess_exec()
-        #
-        # because your current Windows event-loop configuration
-        # caused NotImplementedError.
         proc = await asyncio.to_thread(
             start_process
         )
@@ -450,7 +474,9 @@ async def start_preview(
     # Register process
     # --------------------------------------------------------
 
-    _RUNNING_PROCESSES[project.id] = proc
+    _RUNNING_PROCESSES[
+        project.id
+    ] = proc
 
     row.pid = proc.pid
 
@@ -458,7 +484,8 @@ async def start_preview(
     session.commit()
 
     logger.info(
-        "Preview process started: project=%s pid=%s port=%s",
+        "Preview process started: "
+        "project=%s pid=%s port=%s",
         project.id,
         proc.pid,
         port,
@@ -476,13 +503,15 @@ async def start_preview(
     )
 
     # --------------------------------------------------------
-    # Health check
+    # Private localhost health check
     # --------------------------------------------------------
 
-    url = f"http://127.0.0.1:{port}"
+    private_url = (
+        f"http://127.0.0.1:{port}"
+    )
 
     responsive = await _wait_until_responsive(
-        url,
+        private_url,
         timeout_seconds=90,
     )
 
@@ -495,11 +524,14 @@ async def start_preview(
         returncode = proc.poll()
 
         if returncode is None:
+
             error_message = (
                 "Preview server did not become "
                 "responsive within 90 seconds."
             )
+
         else:
+
             error_message = (
                 "Preview server exited unexpectedly "
                 f"with code {returncode}."
@@ -516,21 +548,31 @@ async def start_preview(
             returncode,
         )
 
-        # Clean process
         try:
+
             if proc.poll() is None:
+
                 proc.terminate()
 
                 try:
+
                     await asyncio.wait_for(
-                        asyncio.to_thread(proc.wait),
+                        asyncio.to_thread(
+                            proc.wait
+                        ),
                         timeout=5,
                     )
+
                 except asyncio.TimeoutError:
+
                     proc.kill()
-                    await asyncio.to_thread(proc.wait)
+
+                    await asyncio.to_thread(
+                        proc.wait
+                    )
 
         except Exception:
+
             logger.exception(
                 "Error cleaning failed preview process"
             )
@@ -556,7 +598,7 @@ async def start_preview(
         return row
 
     # --------------------------------------------------------
-    # Check process after successful HTTP response
+    # Check process after successful response
     # --------------------------------------------------------
 
     returncode = proc.poll()
@@ -564,6 +606,7 @@ async def start_preview(
     if returncode is not None:
 
         row.status = PreviewStatus.FAILED
+
         row.error_message = (
             "Preview server exited unexpectedly "
             f"with code {returncode}"
@@ -594,7 +637,13 @@ async def start_preview(
     # --------------------------------------------------------
 
     row.status = PreviewStatus.RUNNING
-    row.url = url
+
+    # IMPORTANT:
+    # Store the browser-facing proxy URL, not localhost.
+    row.url = get_public_preview_url(
+        project.id
+    )
+
     row.error_message = None
 
     session.add(row)
@@ -603,14 +652,14 @@ async def start_preview(
     logger.info(
         "Preview is READY: project=%s url=%s",
         project.id,
-        url,
+        row.url,
     )
 
     await event_bus.publish(
         project.id,
         "preview_ready",
         {
-            "url": url,
+            "url": row.url,
         },
     )
 
@@ -648,7 +697,8 @@ async def stop_preview(
             if proc.poll() is None:
 
                 logger.info(
-                    "Stopping preview: project=%s pid=%s",
+                    "Stopping preview: "
+                    "project=%s pid=%s",
                     project_id,
                     proc.pid,
                 )
@@ -656,16 +706,20 @@ async def stop_preview(
                 proc.terminate()
 
                 try:
+
                     await asyncio.wait_for(
-                        asyncio.to_thread(proc.wait),
+                        asyncio.to_thread(
+                            proc.wait
+                        ),
                         timeout=10,
                     )
 
                 except asyncio.TimeoutError:
 
                     logger.warning(
-                        "Preview did not terminate gracefully. "
-                        "Killing process: project=%s pid=%s",
+                        "Preview did not terminate "
+                        "gracefully. Killing process: "
+                        "project=%s pid=%s",
                         project_id,
                         proc.pid,
                     )
@@ -677,6 +731,7 @@ async def stop_preview(
                     )
 
         except Exception:
+
             logger.exception(
                 "Error stopping preview process: "
                 "project=%s",
@@ -696,6 +751,7 @@ async def stop_preview(
 
         row.status = PreviewStatus.STOPPED
         row.pid = None
+        row.url = None
 
         session.add(row)
         session.commit()
