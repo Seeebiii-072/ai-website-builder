@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     model_max_output_tokens: int = 16000
     model_temperature: float = 0.2
 
+    # Which provider to try first: "gemini" or "openrouter". The other one is
+    # used as the automatic fallback. Also falls back on invalid/truncated
+    # JSON from the primary, not just network/HTTP failures.
     llm_primary_provider: str = "gemini"
 
     frontend_url: str = "http://localhost:3000"
@@ -23,14 +26,20 @@ class Settings(BaseSettings):
     preview_start_port: int = 3001
     preview_max_port: int = 3100
 
+    # Host the dev server process binds to (0.0.0.0 to accept connections
+    # from outside the machine), and the host name put into the browser-
+    # facing preview_url. Both default to 127.0.0.1 for local development,
+    # where they're the same thing. On a real server these MUST differ:
+    # PREVIEW_BIND_HOST=0.0.0.0, PREVIEW_PUBLIC_HOST=<server's public IP or
+    # domain> - otherwise the preview is unreachable from the browser (it
+    # would only be reachable by the backend process itself over loopback).
     preview_bind_host: str = "127.0.0.1"
     preview_public_host: str = "127.0.0.1"
 
     max_debug_attempts: int = 3
 
-    # Railway writable paths
-    database_url: str = "sqlite:////tmp/app.db"
-    projects_dir: str = "/tmp/projects"
+    database_url: str = "sqlite:///./data/app.db"
+    projects_dir: str = "./data/projects"
 
     class Config:
         env_file = ".env"
@@ -38,7 +47,7 @@ class Settings(BaseSettings):
 
     @property
     def projects_path(self) -> Path:
-        p = Path(self.projects_dir)
+        p = Path(self.projects_dir).resolve()
         p.mkdir(parents=True, exist_ok=True)
         return p
 
